@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Live Vehicle Trackings</title>
+    <title>Live Vehicle Trackingssdc</title>
 
     <style>
         body { margin:0; font-family: Arial, sans-serif; }
