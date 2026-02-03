@@ -12,49 +12,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Deploy to EC2 via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SERVER_IP }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: 22
-          script_stop: true
-          script: |
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to EC2
+        run: |
+          ssh ec2-user@${{ secrets.SERVER_IP }} << 'EOF'
             set -e
 
             echo "🚀 Deploy started"
-
             cd /var/www/nextgenstep
 
-            echo "🔄 Fix ownership"
-            sudo chown -R ec2-user:ec2-user /var/www/nextgenstep
+            sudo chown -R ec2-user:ec2-user .
 
-            echo "📥 Pull latest code"
             git reset --hard
             git clean -fd
             git pull origin main
 
-            echo "📦 Composer install"
             /usr/bin/composer install --no-interaction --prefer-dist --optimize-autoloader
 
-            echo "🧹 Laravel cache clear"
-            php artisan config:clear
-            php artisan route:clear
-            php artisan view:clear
-            php artisan cache:clear
-
-            echo "🗄️ Run migrations"
             php artisan migrate --force
+            php artisan optimize
 
-            echo "🔐 Fix permissions"
-            chmod -R 775 storage bootstrap/cache
-
-            echo "♻️ Restart services"
             sudo systemctl restart php-fpm
             sudo systemctl restart nginx
 
-            echo "📡 Restart GT06 listener"
-            sudo systemctl restart gt06 || true
-
             echo "✅ Deploy finished successfully"
+          EOF
