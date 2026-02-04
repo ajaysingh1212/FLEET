@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Ajay</title>
+    <title>Ajay Kumar</title>
 
     <style>
         body { margin:0; font-family: Arial, sans-serif; }
