@@ -11,7 +11,7 @@ use Carbon\Carbon;
 class Gt06TcpServer extends Command
 {
     protected $signature = 'gt06:listen {--port=5023}';
-    protected $description = 'GT06 / PT06 TCP GPS Server (Production Safe)';
+    protected $description = 'GT06 / PT06 TCP GPS Server';
 
     public function handle()
     {
@@ -22,109 +22,154 @@ class Gt06TcpServer extends Command
         $port = (int)$this->option('port');
 
         $master = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
-
         socket_set_option($master, SOL_SOCKET, SO_REUSEADDR, 1);
-        socket_set_option($master, SOL_SOCKET, SO_KEEPALIVE, 1);
-
         socket_bind($master, $host, $port);
-        socket_listen($master, 100);
+        socket_listen($master);
 
-        $this->info("🚀 GT06 TCP Server listening on {$host}:{$port}");
+        $this->info("🚀 GT06 TCP Server running on port {$port}");
 
         while (true) {
-            $client = @socket_accept($master);
-            if (!$client) {
-                usleep(100000);
+
+            $client = socket_accept($master);
+            socket_getpeername($client, $ip);
+
+            $bin = socket_read($client, 2048, PHP_BINARY_READ);
+            if (!$bin) {
+                socket_close($client);
                 continue;
             }
 
-            socket_set_option($client, SOL_SOCKET, SO_KEEPALIVE, 1);
-            socket_set_option($client, SOL_SOCKET, SO_RCVTIMEO, ['sec' => 30, 'usec' => 0]);
+            $hex = strtoupper(bin2hex($bin));
 
-            socket_getpeername($client, $ip);
-            $this->line("🔌 Connected: {$ip}");
+            // Header check
+            if (substr($hex, 0, 4) !== '7878') {
+                socket_close($client);
+                continue;
+            }
 
-            while (true) {
-                $bin = @socket_read($client, 2048, PHP_BINARY_READ);
+            $protocol = substr($hex, 6, 2);
 
-                if ($bin === false || $bin === '') {
-                    $this->line("❌ Disconnected: {$ip}");
-                    break;
+            /* =====================================================
+             * LOGIN PACKET (0x01)
+             * ===================================================== */
+            if ($protocol === '01') {
+
+                $imeiHex = substr($hex, 8, 16);
+                $imei = $this->decodeImeiBCD($imeiHex);
+
+                if (!$imei) {
+                    $this->error("❌ Invalid IMEI");
+                    socket_close($client);
+                    continue;
                 }
 
-                $hex = strtoupper(bin2hex($bin));
-                if (substr($hex, 0, 4) !== '7878') continue;
+                Device::firstOrCreate(['imei' => $imei]);
 
-                $protocol = substr($hex, 6, 2);
+                $this->info("📱 LOGIN | IMEI: {$imei}");
 
-                /* ================= LOGIN ================= */
-                if ($protocol === '01') {
-                    $imei = $this->decodeImeiBCD(substr($hex, 8, 16));
-                    if ($imei) {
-                        Device::firstOrCreate(['imei' => $imei]);
-                        $this->info("📱 LOGIN | {$imei}");
-                        socket_write($client, hex2bin('787805010001D9DC0D0A'));
-                    }
+                // LOGIN ACK
+                socket_write($client, hex2bin('787805010001D9DC0D0A'));
+                socket_close($client);
+                continue;
+            }
+
+            /* =====================================================
+             * HEARTBEAT (0x13)
+             * ===================================================== */
+            if ($protocol === '13') {
+
+                $imei = $this->extractImeiFromPacket($hex);
+                if (!$imei) {
+                    socket_close($client);
+                    continue;
                 }
 
-                /* ================= HEARTBEAT ================= */
-                elseif ($protocol === '13') {
-                    $imei = $this->extractImeiFromPacket($hex);
-                    $this->line("❤️ HEARTBEAT | {$imei}");
-                    socket_write($client, hex2bin('787805130001D9DC0D0A'));
+                $this->line("❤️ HEARTBEAT | {$imei}");
+
+                socket_write($client, hex2bin('787805130001D9DC0D0A'));
+                socket_close($client);
+                continue;
+            }
+
+            /* =====================================================
+             * LOCATION PACKET (0x22)
+             * ===================================================== */
+            if ($protocol === '22') {
+
+                $imei = $this->extractImeiFromPacket($hex);
+                if (!$imei) {
+                    socket_close($client);
+                    continue;
                 }
 
-                /* ================= LOCATION ================= */
-                elseif ($protocol === '22') {
-                    $imei = $this->extractImeiFromPacket($hex);
-                    if (!$imei) continue;
+                $timeUtc = $this->decodeDateTime(substr($hex, 8, 12));
+                $lat     = $this->decodeCoord(substr($hex, 20, 8));
+                $lon     = $this->decodeCoord(substr($hex, 28, 8));
+                $speed   = hexdec(substr($hex, 36, 2));
 
-                    $trackedAt = Carbon::parse($this->decodeDateTime(substr($hex, 8, 12)));
-                    $lat   = $this->decodeCoord(substr($hex, 20, 8));
-                    $lon   = $this->decodeCoord(substr($hex, 28, 8));
-                    $speed = hexdec(substr($hex, 36, 2));
+                $courseStatus = hexdec(substr($hex, 38, 4));
+                $course   = $courseStatus & 0x03FF;
+                $ignition = ($courseStatus & 0x0400) !== 0;
+                $gpsValid = ($courseStatus & 0x8000) !== 0;
 
-                    $courseStatus = hexdec(substr($hex, 38, 4));
-                    $course   = $courseStatus & 0x03FF;
-                    $ignition = ($courseStatus & 0x0400) !== 0;
-                    $gpsValid = ($courseStatus & 0x8000) !== 0;
-
-                    if ($gpsValid) {
-                        DeviceLocation::create([
-                            'imei' => $imei,
-                            'tracked_at' => $trackedAt,
-                            'latitude' => $lat,
-                            'longitude' => $lon,
-                            'speed' => $speed,
-                            'course' => $course,
-                            'ignition' => $ignition,
-                            'gps_valid' => true,
-                        ]);
-
-                        LiveLocation::updateOrCreate(
-                            ['imei' => $imei],
-                            [
-                                'latitude' => $lat,
-                                'longitude' => $lon,
-                                'speed' => $speed,
-                                'course' => $course,
-                                'ignition' => $ignition,
-                                'gps_valid' => true,
-                                'tracked_at' => $trackedAt,
-                            ]
-                        );
-
-                        $this->line("📍 {$imei} | {$lat},{$lon} | {$speed} km/h");
-                        socket_write($client, hex2bin('787805220001D9DC0D0A'));
-                    }
+                if (!$gpsValid) {
+                    socket_close($client);
+                    continue;
                 }
+
+                if ($speed > 180) $speed = 0;
+
+                $trackedAt = Carbon::parse($timeUtc);
+
+                /* -------- Save History -------- */
+                DeviceLocation::create([
+                    'imei'       => $imei,
+                    'tracked_at' => $trackedAt,
+                    'latitude'   => $lat,
+                    'longitude'  => $lon,
+                    'speed'      => $speed,
+                    'course'     => $course,
+                    'ignition'   => $ignition,
+                    'gps_valid'  => true,
+                ]);
+
+                /* -------- Update Live Location -------- */
+                LiveLocation::updateOrCreate(
+                    ['imei' => $imei],
+                    [
+                        'latitude'   => $lat,
+                        'longitude'  => $lon,
+                        'speed'      => $speed,
+                        'course'     => $course,
+                        'ignition'   => $ignition,
+                        'gps_valid'  => true,
+                        'tracked_at' => $trackedAt,
+                    ]
+                );
+
+                $this->line("📍 {$imei} | {$lat},{$lon} | {$speed} km/h");
+
+                // LOCATION ACK
+                socket_write($client, hex2bin('787805220001D9DC0D0A'));
+                socket_close($client);
+                continue;
+            }
+
+            /* =====================================================
+             * ALARM (0x26)
+             * ===================================================== */
+            if ($protocol === '26') {
+                $imei = $this->extractImeiFromPacket($hex);
+                $this->error("🚨 ALARM | {$imei}");
             }
 
             socket_close($client);
         }
     }
 
-    /* ================= HELPERS ================= */
+    /* =====================================================
+     * HELPERS
+     * ===================================================== */
 
     private function decodeImeiBCD(string $hex): ?string
     {
@@ -132,7 +177,8 @@ class Gt06TcpServer extends Command
         for ($i = 0; $i < strlen($hex); $i += 2) {
             $imei .= str_pad(hexdec(substr($hex, $i, 2)), 2, '0', STR_PAD_LEFT);
         }
-        return strlen($imei) >= 15 ? substr($imei, 0, 15) : null;
+        $imei = substr($imei, 0, 15);
+        return strlen($imei) === 15 ? $imei : null;
     }
 
     private function decodeCoord(string $hex): float
@@ -153,10 +199,15 @@ class Gt06TcpServer extends Command
         );
     }
 
+    /**
+     * Extract IMEI safely from GT06 packet
+     */
     private function extractImeiFromPacket(string $hex): ?string
     {
         $pos = strpos($hex, '0D0A');
         if ($pos === false) return null;
-        return $this->decodeImeiBCD(substr($hex, $pos - 18, 16));
+
+        $imeiHex = substr($hex, $pos - 18, 16);
+        return $this->decodeImeiBCD($imeiHex);
     }
 }
